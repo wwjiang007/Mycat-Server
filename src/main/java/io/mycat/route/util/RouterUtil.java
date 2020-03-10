@@ -182,10 +182,22 @@ public class RouterUtil {
 	public static RouteResultset routeToDDLNode(RouteResultset rrs, int sqlType, String stmt,SchemaConfig schema) throws SQLSyntaxErrorException {
 		stmt = getFixedSql(stmt);
 		String tablename = "";
+		//去除sql前面的注册,如/* ApplicationName=DBeaver 6.0.1 - Main */，这个注册会导致create table出错
+		stmt = stmt.replaceFirst("\\/\\*.*\\*\\/\\s*", "");
 		final String upStmt = stmt.toUpperCase();
+		String rrsStmt = new String(upStmt);
 		if(upStmt.startsWith("CREATE")){
 			if (upStmt.contains("CREATE INDEX ") || upStmt.contains("CREATE UNIQUE INDEX ")){
 				tablename = RouterUtil.getTableName(stmt, RouterUtil.getCreateIndexPos(upStmt, 0));
+				/**
+				 * Date：2017年11月2日
+				 * @author SvenAugustus
+				修复oracle 语法不支持 drop index i_t_f on t_test，只有drop index i_t_f;
+				 */
+				if(!"oracle".equalsIgnoreCase(schema.getDefaultDataNodeDbType())){
+					int onInd = upStmt.indexOf("ON", 0);
+					rrsStmt= upStmt.substring(0, onInd);
+				}
 			}else {
 				tablename = RouterUtil.getTableName(stmt, RouterUtil.getCreateTablePos(upStmt, 0));
 			}
@@ -226,9 +238,11 @@ public class RouterUtil {
 					}  else if(isSlotFunction){
 						nodes[i].setSlot(-1);
 					}
+					nodes[i].setStatement(rrsStmt);
 				}
 				rrs.setNodes(nodes);
 			}
+			rrs.setStatement(rrsStmt);
 			return rrs;
 		}else if(schema.getDataNode()!=null){		//默认节点ddl
 			RouteResultsetNode[] nodes = new RouteResultsetNode[1];
@@ -322,8 +336,9 @@ public class RouterUtil {
 	 * @return 表名
 	 * @author AStoneGod
 	 */
-	public static String getShowTableName(String stmt, int[] repPos) {
+	public static String getShowTableName(SchemaConfig schema, String stmt, int[] repPos) {
 		int startPos = repPos[0];
+        startPos = getStartPos(stmt, startPos);
 		int secInd = stmt.indexOf(' ', startPos + 1);
 		if (secInd < 0) {
 			secInd = stmt.length();
@@ -331,8 +346,11 @@ public class RouterUtil {
 
 		repPos[1] = secInd;
 		String tableName = stmt.substring(startPos, secInd).trim();
+        if (!schema.isCheckSQLSchema()) {
+            return tableName;
+        }
 
-		int ind2 = tableName.indexOf('.');
+        int ind2 = tableName.indexOf('.');
 		if (ind2 > 0) {
 			tableName = tableName.substring(ind2 + 1);
 		}
@@ -554,7 +572,7 @@ public class RouterUtil {
 	}
 
 	public static void processSQL(ServerConnection sc,SchemaConfig schema,String sql,int sqlType){
-//		int sequenceHandlerType = MycatServer.getInstance().getConfig().getSystem().getSequnceHandlerType();
+//		int sequenceHandlerType = MycatServer.getInstance().getConfig().getSystem().getSequenceHandlerType();
 		final SessionSQLPair sessionSQLPair = new SessionSQLPair(sc.getSession2(), schema, sql, sqlType);
 //      modify by yanjunli  序列获取修改为多线程方式。使用分段锁方式,一个序列一把锁。  begin
 //		MycatServer.getInstance().getSequnceProcessor().addNewSql(sessionSQLPair);
@@ -986,7 +1004,7 @@ public class RouterUtil {
 	 * @param tc
 	 * @return
 	 */
-	private static String getAliveRandomDataNode(TableConfig tc) {
+	public static String getAliveRandomDataNode(TableConfig tc) {
 		List<String> randomDns = (List<String>)tc.getDataNodes().clone();
 
 		MycatConfig mycatConfig = MycatServer.getInstance().getConfig();
@@ -1210,6 +1228,11 @@ public class RouterUtil {
 
 		List<String> tables = ctx.getTables();
 
+
+		if(schema.isNoSharding()||(tables.size() >= 1&&isNoSharding(schema,tables.get(0)))) {
+			return routeToSingleNode(rrs, schema.getDataNode(), ctx.getSql());
+		}
+
 		//每个表对应的路由映射
 		Map<String,Set<String>> tablesRouteMap = new HashMap<String,Set<String>>();
 
@@ -1253,9 +1276,6 @@ public class RouterUtil {
 			}
 		}
 
-		if(schema.isNoSharding()||(tables.size() >= 1&&isNoSharding(schema,tables.get(0)))) {
-			return routeToSingleNode(rrs, schema.getDataNode(), ctx.getSql());
-		}
 
 		//只有一个表的
 		if(tables.size() == 1) {
@@ -1454,12 +1474,23 @@ public class RouterUtil {
 						if(pair.rangeValue != null) {
 							Integer[] tableIndexs = algorithm
 									.calculateRange(StringUtil.removeBackquote(pair.rangeValue.beginValue.toString()),StringUtil.removeBackquote(pair.rangeValue.endValue.toString()));
-							for(Integer idx : tableIndexs) {
-								String subTable = tableConfig.getDistTables().get(idx);
-								if(subTable != null) {
-									tablesRouteSet.add(subTable);
-									if(algorithm instanceof SlotFunction){
-										rrs.getDataNodeSlotMap().put(subTable,((SlotFunction) algorithm).slotValue());
+							if (tableIndexs.length == 0){
+								for(String subTable  : tableConfig.getDistTables()) {
+									if(subTable != null) {
+										tablesRouteSet.add(subTable);
+										if(algorithm instanceof SlotFunction){
+											rrs.getDataNodeSlotMap().put(subTable,((SlotFunction) algorithm).slotValue());
+										}
+									}
+								}
+							}else {
+								for(Integer idx : tableIndexs) {
+									String subTable = tableConfig.getDistTables().get(idx);
+									if(subTable != null) {
+										tablesRouteSet.add(subTable);
+										if(algorithm instanceof SlotFunction){
+											rrs.getDataNodeSlotMap().put(subTable,((SlotFunction) algorithm).slotValue());
+										}
 									}
 								}
 							}
@@ -1590,6 +1621,7 @@ public class RouterUtil {
 							LOGGER.debug("try to find cache by primary key ");
 						}
 						String tableKey = schema.getName() + '_' + tableName;
+						tableKey = tableKey.toUpperCase();
 						boolean allFound = true;
 						for (ColumnRoutePair pair : primaryKeyPairs) {//可能id in(1,2,3)多主键
 							String cacheKey = pair.colValue;
@@ -1616,6 +1648,7 @@ public class RouterUtil {
 					}
 				}
 				if (isFoundPartitionValue) {//分库表
+                    tablesRouteMap.clear();
 					Set<ColumnRoutePair> partitionValue = columnsMap.get(partionCol);
 					if(partitionValue == null || partitionValue.size() == 0) {
 						if(tablesRouteMap.get(tableName) == null) {
@@ -2016,5 +2049,20 @@ public class RouterUtil {
 		return (insertStmt.getValuesList() != null && insertStmt.getValuesList().size() > 1)
 				|| insertStmt.getQuery() != null;
 	}
-
+    /**
+     * escape white spaces and get the real start position.
+     * @author kevin
+     * @param stmt  The sql statement.
+     * @param startPos  The initial start position.
+     * @return  int  The real start position.
+     */
+    private static int getStartPos(String stmt, int startPos) {
+        while (startPos < stmt.length()) {
+            if (!Character.isWhitespace(stmt.charAt(startPos))) {
+                break;
+            }
+            ++startPos;
+        }
+        return startPos;
+    }
 }
